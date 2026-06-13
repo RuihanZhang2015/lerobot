@@ -1,0 +1,4 @@
+interface:
+  display_name: "Collect SO-101 Pick and Place"
+  short_description: "Record and manage SO-101 demonstrations"
+  default_prompt: "Use $collect-so101-pick-and-place to collect my blue-box pick-and-place dataset."
