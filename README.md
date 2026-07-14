@@ -1,181 +1,197 @@
-<p align="center">
-  <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
-</p>
+# SO-101 candy picking — pi0.5 LoRA experiments
 
-<div align="center">
+A working fork of [LeRobot](https://github.com/huggingface/lerobot) used to teach an SO-101 arm
+to pick up a candy and drop it in a container, with a [pi0.5](https://github.com/Physical-Intelligence/openpi)
+policy fine-tuned via LoRA.
 
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml?query=branch%3Amain)
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml?query=branch%3Amain)
-[![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
-[![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
-[![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
-[![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/q8Dzzpym3f)
+The task string is the same everywhere and must stay that way — the policy is prompted with it at
+inference:
 
-</div>
+> `Pick up the object and place it in the container`
 
-**LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
+Upstream LeRobot docs live at [huggingface.co/docs/lerobot](https://huggingface.co/docs/lerobot);
+this README covers only what is specific to these experiments. For general SO-101 setup
+(calibration, ports, cameras) see [`AGENT_GUIDE.md`](./AGENT_GUIDE.md).
 
-🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
+---
 
-🤗 A standardized, scalable LeRobotDataset format (Parquet + MP4 or images) hosted on the Hugging Face Hub, enabling efficient storage, streaming and visualization of massive robotic datasets.
+## Hardware
 
-🤗 State-of-the-art policies that have been shown to transfer to the real-world ready for training and deployment.
+| Part | Value |
+| --- | --- |
+| Follower | SO-101, `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AA9024137-if00` |
+| Leader | SO-101, `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AA9024308-if00` |
+| Cameras | `top` = `/dev/video0`, `wrist` = `/dev/video2` — both 1280×720 MJPG @ 30fps |
+| GPU | RTX 5090, 32 GB |
 
-🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
+Use the `by-id` paths, not `/dev/ttyACM*` — the ACM numbering swaps between reboots and will
+happily point the follower driver at the leader arm.
 
-## Quick Start
+Two Python environments are in play, and mixing them up is the single most common failure:
 
-LeRobot can be installed directly from PyPI.
+| Env | Used for | Interpreter |
+| --- | --- | --- |
+| `lerobot-src` | recording, conversion, eval client | `~/miniforge3/envs/lerobot-src/bin/python` |
+| openpi `.venv` | policy server, training | `cd ~/ke/openpi && uv run ...` |
 
-```bash
-pip install lerobot
-lerobot-info
-```
+A plain `python` from the wrong conda env fails with
+`ImportError: 'datasets' is required but not installed`.
 
-> [!IMPORTANT]
-> For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
+---
 
-## Robots & Control
+## The scripts in this repo
 
-<div align="center">
-  <img src="./media/readme/robots_control_video.webp" width="640px" alt="Reachy 2 Demo">
-</div>
+| Script | What it does |
+| --- | --- |
+| [`record_ab.py`](./record_ab.py) | Press-A-to-start / press-B-to-stop recording. The arm is frozen until you press A, so the scene can be reset between demos. |
+| [`record_recovery.py`](./record_recovery.py) | Adds a **staging** phase: `C` drives the arm via teleop *without recording*, so you can put the robot and scene into a failed state, then `A` records only the recovery from it. |
+| [`convert_v30_to_v21.py`](./convert_v30_to_v21.py) | Downgrades a LeRobot v3.0 dataset to the v2.1 layout. openpi pins an older lerobot that cannot read v3.0, and lerobot only ships the forward converter. |
+| [`eval_so101_openpi.py`](./eval_so101_openpi.py) | Real-time eval bridge: streams observations to an openpi policy server over websocket and executes the returned action chunks on the arm. |
 
-LeRobot provides a unified `Robot` class interface that decouples control logic from hardware specifics. It supports a wide range of robots and teleoperation devices.
+### Why the recovery demos exist
 
-```python
-from lerobot.robots.myrobot import MyRobot
+A policy trained only on clean picks has never seen a dropped candy or a bad grasp pose, so when it
+fails it has no idea what to do next. `record_recovery.py` exists to fix that: you hand-stage the
+failure (knock the candy over, drag the arm somewhere useless) with teleop while nothing is being
+written, and then record *only* the recovery. Staging calls `record_loop` with `dataset=None`, so no
+frames land in the dataset.
 
-# Connect to a robot
-robot = MyRobot(config=...)
-robot.connect()
+Cycle: `[idle] --C--> [teleop, not recording] --A--> [recording] --B--> save`
 
-# Read observation and send action
-obs = robot.get_observation()
-action = model.select_action(obs)
-robot.send_action(action)
-```
+`C` is refused when no teleoperator is configured — `record_loop`'s no-teleop branch skips its sleep
+and would busy-spin.
 
-**Supported Hardware:** SO100, LeKiwi, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones, OpenARM, Unitree G1, reBot B601.
+---
 
-While these devices are natively integrated into the LeRobot codebase, the library is designed to be extensible. You can easily implement the Robot interface to utilize LeRobot's data collection, training, and visualization tools for your own custom robot.
+## Datasets collected
 
-For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
+All are v3.0, 30fps, 6-DoF action + state, two 720p cameras, `so_follower`, one shared task string.
 
-## LeRobot Dataset
+| Dataset | Episodes | Frames | Notes |
+| --- | --- | --- | --- |
+| `pick_up_candy` | 31 | 13,370 | First batch. This is what the current checkpoint was trained on. |
+| `pick_candy2` | 13 | 5,759 | |
+| `pick_candy3` | 9 | 3,593 | |
+| `pick_candy_recovery` | 6 | 3,301 | Failure-recovery demos, staged with `record_recovery.py`. |
+| **`pick_candy_all`** | **59** | **26,023** | Merge of all four, for the next training run. |
 
-To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
+They live under `~/lerobot_data/<name>` (v3.0); the v2.1 copies openpi trains from land in
+`~/.cache/huggingface/lerobot/<repo_id>`.
 
-- **Structure:** Synchronized MP4 videos (or images) for vision and Parquet files for state/action data.
-- **HF Hub Integration:** Explore thousands of robotics datasets on the [Hugging Face Hub](https://huggingface.co/lerobot).
-- **Tools:** Seamlessly delete episodes, split by indices/fractions, add/remove features, and merge multiple datasets.
-
-```python
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-# Load a dataset from the Hub
-dataset = LeRobotDataset("lerobot/aloha_mobile_cabinet")
-
-# Access data (automatically handles video decoding)
-episode_index=0
-print(f"{dataset[episode_index]['action'].shape=}\n")
-```
-
-Learn more about it in the [LeRobotDataset Documentation](https://huggingface.co/docs/lerobot/lerobot-dataset-v3)
-
-## SoTA Models
-
-LeRobot implements state-of-the-art policies in pure PyTorch, covering Imitation Learning, Reinforcement Learning, Vision-Language-Action (VLA) models, World Models, and Reward Models, with more coming soon. It also provides you with the tools to instrument and inspect your training process.
-
-<p align="center">
-  <img alt="Gr00t Architecture" src="./media/readme/VLA_architecture.jpg" width="640px">
-</p>
-
-Training a policy is as simple as running a script configuration:
+### Recording
 
 ```bash
-lerobot-train \
-  --policy.type=act \
-  --dataset.repo_id=lerobot/aloha_mobile_cabinet
+~/miniforge3/envs/lerobot-src/bin/python record_recovery.py \
+  --robot.type=so101_follower \
+  --robot.port=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AA9024137-if00 \
+  --robot.id=so101_follower_main \
+  --robot.cameras='{top: {type: opencv, index_or_path: "/dev/video0", width: 1280, height: 720, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: "/dev/video2", width: 1280, height: 720, fps: 30, fourcc: "MJPG"}}' \
+  --teleop.type=so101_leader \
+  --teleop.port=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AA9024308-if00 \
+  --teleop.id=so101_leader_main \
+  --dataset.repo_id=local/pick_candy_recovery2 \
+  --dataset.root="$HOME/lerobot_data/pick_candy_recovery2" \
+  --dataset.num_episodes=20 --dataset.episode_time_s=3600 --dataset.fps=30 \
+  --dataset.single_task="Pick up the object and place it in the container" \
+  --dataset.push_to_hub=false --display_data=true
 ```
 
-| Category                   | Models                                                                                                                                                                                                                                                                                                                                                                                     |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md), [Multitask DiT Policy](./docs/source/policy_multi_task_dit_README.md)                                                                                                                                                                    |
-| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                                                                                                                                                                                                |
-| **VLAs Models**            | [Pi0](./docs/source/pi0.mdx), [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [GR00T N1.7](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx), [EO-1](./docs/source/eo1.mdx), [MolmoAct2](./docs/source/molmoact2.mdx), [WALL-OSS](./docs/source/walloss.mdx), [EVO1](./docs/source/evo1.mdx) |
-| **World Models**           | [VLA-JEPA](./docs/source/vla_jepa.mdx), [LingBot-VA](./docs/source/lingbot_va.mdx), [FastWAM](./docs/source/fastwam.mdx)                                                                                                                                                                                                                                                                   |
-| **Reward Models**          | [SARM](./docs/source/sarm.mdx), [TOPReward](./docs/source/topreward.mdx), [Robometer](./docs/source/robometer.mdx)                                                                                                                                                                                                                                                                         |
+Keep the leader and follower roughly aligned before pressing `C` or `A` — the follower snaps to the
+leader's pose on the first frame of each phase. `--robot.max_relative_target` clamps how far a single
+step may move if that worries you.
 
-Similarly to the hardware, you can easily implement your own policy & leverage LeRobot's data collection, training, and visualization tools, and share your model to the HF Hub
+Pasting a multi-line command with trailing backslashes into some terminals mangles the later flags
+(bracketed paste). If flags come out garbled, paste it as one line.
 
-For detailed policy setup guides, see the [Policy Documentation](https://huggingface.co/docs/lerobot/bring_your_own_policies). For GPU/RAM requirements and expected training time per policy, see the [Compute Hardware Guide](https://huggingface.co/docs/lerobot/hardware_guide).
+---
 
-## Inference & Evaluation
+## Merging + converting
 
-Evaluate your policies in simulation or on real hardware using the unified evaluation script. LeRobot supports standard benchmarks like **LIBERO**, **MetaWorld** and more to come.
+`merge_datasets` (from `lerobot.datasets.dataset_tools`) concatenates the v3.0 datasets and reindexes
+episodes; the four sources are schema-identical, so they merge without fixups. Then the merged set is
+downgraded to v2.1 for openpi:
 
 ```bash
-# Evaluate a policy on the LIBERO benchmark
-lerobot-eval \
-  --policy.path=lerobot/pi0_libero_finetuned \
-  --env.type=libero \
-  --env.task=libero_object \
-  --eval.n_episodes=10
+~/miniforge3/envs/lerobot-src/bin/python convert_v30_to_v21.py \
+  --src ~/lerobot_data/pick_candy_all --repo-id pick_candy_all
 ```
 
-Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub)
+The conversion decodes and re-encodes every episode's video for both cameras (guaranteeing the MP4
+frame count matches the parquet row count), so it takes a while — it is the slow step, not the
+training setup.
 
-## Resources
+---
 
-- **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
-- **[Chinese Tutorials: LeRobot+SO-ARM101中文教程-同济子豪兄](https://zihao-ai.feishu.cn/wiki/space/7589642043471924447)** Detailed doc for assembling, teleoperate, dataset, train, deploy. Verified by Seed Studio and 5 global hackathon players.
-- **[Discord](https://discord.gg/q8Dzzpym3f):** Join the `LeRobot` server to discuss with the community.
-- **[X](https://x.com/LeRobotHF):** Follow us on X to stay up-to-date with the latest developments.
-- **[Robot Learning Tutorial](https://huggingface.co/spaces/lerobot/robot-learning-tutorial):** A free, hands-on course to learn robot learning using LeRobot.
-- **[T-Shirt Folding Experiment](https://huggingface.co/spaces/lerobot/robot-folding):** An end-to-end demonstration of folding t-shirts with LeRobot.
-- **[LeLab](https://github.com/huggingface/leLab):** A web interface for LeRobot — teleoperate, calibrate, record datasets, replay, and train your SO arm from the browser, no CLI required.
+## Training
 
-## Citation
+openpi config `pi05_so101_lora_all` in `~/ke/openpi/src/openpi/training/config.py`: pi0.5 with LoRA on
+both the VLM (`gemma_2b_lora`) and the action expert (`gemma_300m_lora`), delta actions, action horizon
+50, batch size 32, 10k steps with a cosine schedule (1k warmup, peak 5e-5, decaying to 5e-6).
 
-If you use LeRobot in your project, please cite the GitHub repository to acknowledge the ongoing development and contributors:
+It is a **separate config** from the original `pi05_so101_lora` (which is pinned to `pick_up_candy`, 31
+episodes), so the existing checkpoint stays reproducible.
 
-```bibtex
-@misc{cadene2024lerobot,
-    author = {Cadene, Remi and Alibert, Simon and Soare, Alexander and Gallouedec, Quentin and Zouitine, Adil and Palma, Steven and Kooijmans, Pepijn and Aractingi, Michel and Shukor, Mustafa and Aubakirova, Dana and Russi, Martino and Capuano, Francesco and Pascal, Caroline and Choghari, Jade and Meftah, Khalil and Ellerbach, Maxime and Moss, Jess and Wolf, Thomas},
-    title = {LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch},
-    howpublished = "\url{https://github.com/huggingface/lerobot}",
-    year = {2024}
-}
+```bash
+cd ~/ke/openpi
+uv run scripts/compute_norm_stats.py --config-name pi05_so101_lora_all
+uv run scripts/train.py pi05_so101_lora_all --exp-name=pick_candy_all_lora
 ```
 
-If you are referencing our research or the academic paper, please also cite our ICLR publication:
+Free the GPU first — a running policy server holds ~30 GB of the 32 GB card, and training will OOM
+behind it.
 
-<details>
-<summary><b>ICLR 2026 Paper</b></summary>
+If the cosine `decay_steps` is left at 20k while `num_train_steps` is 10k, the LR gets truncated
+mid-decay instead of landing at `decay_lr`. Change them together.
 
-```bibtex
-@inproceedings{cadenelerobot,
-  title={LeRobot: An Open-Source Library for End-to-End Robot Learning},
-  author={Cadene, Remi and Alibert, Simon and Capuano, Francesco and Aractingi, Michel and Zouitine, Adil and Kooijmans, Pepijn and Choghari, Jade and Russi, Martino and Pascal, Caroline and Palma, Steven and Shukor, Mustafa and Moss, Jess and Soare, Alexander and Aubakirova, Dana and Lhoest, Quentin and Gallou\'edec, Quentin and Wolf, Thomas},
-  booktitle={The Fourteenth International Conference on Learning Representations},
-  year={2026},
-  url={https://arxiv.org/abs/2602.22818}
-}
+---
+
+## Eval
+
+Serve the checkpoint (openpi env):
+
+```bash
+cd ~/ke/openpi
+uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.config=pi05_so101_lora \
+  --policy.dir=~/ke/openpi/checkpoints/pi05_so101_lora/pick_up_candy_lora/6000
 ```
 
-</details>
+Then drive the arm (lerobot-src env):
 
-## Contribute
+```bash
+~/miniforge3/envs/lerobot-src/bin/python -u eval_so101_openpi.py \
+  --robot.type=so101_follower \
+  --robot.port=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AA9024137-if00 \
+  --robot.id=so101_follower_main \
+  --robot.cameras='{top: {type: opencv, index_or_path: "/dev/video0", width: 1280, height: 720, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: "/dev/video2", width: 1280, height: 720, fps: 30, fourcc: "MJPG"}}' \
+  --task="Pick up the object and place it in the container" \
+  --host=localhost --port=8000 --fps=30 --duration_s=30
+```
 
-We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](https://github.com/huggingface/lerobot/blob/main/CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
+The server owns image resize, normalization, delta→absolute conversion, and slicing back to the 6
+SO-101 joints, so the client only ships raw observations and executes what comes back.
 
-<p align="center">
-  <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">
-</p>
+Measured on the step-6000 checkpoint: chunks of shape `(50, 6)` returned in **77–81 ms**, and the loop
+held 30fps for the full 900 steps of a 30s rollout. `--actions_per_chunk` (default 25 of the 50-step
+horizon) trades responsiveness against stability.
 
-<div align="center">
-<sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
-</div>
+### If eval prints nothing, it is still driving the arm
+
+`logging.basicConfig()` is a no-op when a root handler already exists — which it does by the time
+`eval_main` runs, thanks to the rerun/draccus/lerobot imports — so the root logger stays at WARNING and
+every progress line vanishes. A silent run looks exactly like a crashed no-op run while the robot is in
+fact moving through the full episode. Fixed with `force=True` in `eval_so101_openpi.py`; if you ever
+see a silent-but-slow run again, treat it as **live, not dead** — check the arm before re-running.
+
+---
+
+## Status
+
+- Current checkpoint: `checkpoints/pi05_so101_lora/pick_up_candy_lora/6000`, trained on `pick_up_candy`
+  only (31 episodes). It serves and runs the arm at 30fps; real-world success rate has not been
+  measured systematically.
+- `pick_candy_all` (59 episodes) is merged and converting to v2.1. Norm stats and the 10k-step training
+  run have not been done yet.
+- `pick_candy_recovery2` was set up but never recorded — the dataset does not exist.
+- The openpi-side changes (`pi05_so101_lora_all` config, `so101_policy.py`) are uncommitted: that
+  checkout's `origin` is `Physical-Intelligence/openpi` upstream, with no personal fork configured.
