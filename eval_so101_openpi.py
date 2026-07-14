@@ -108,7 +108,12 @@ def _camera_display_loop(robot, cam_keys, stop_event, fps):
 
 @draccus.wrap()
 def eval_main(cfg: EvalConfig):
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # force=True: an import (rerun/draccus/lerobot) may already have attached a root handler,
+    # which would make basicConfig a silent no-op and leave the root logger at WARNING —
+    # dropping every progress line below.
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True
+    )
 
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
